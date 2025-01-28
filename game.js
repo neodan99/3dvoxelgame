@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 
+
 const TIME_SETTINGS = {
     DAY_LENGTH_SECONDS: 600,
     CELESTIAL_RADIUS: 300,
