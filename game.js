@@ -34,6 +34,17 @@ for(let i = 0; i < 255; i++) {
 }
 for(let i = 256; i < 512; i++) p[i] = p[i-256];
 
+const BLOCKS = {
+    AIR: 0,
+    DIRT: 1,
+    GRASS: 2,
+    STONE: 3,
+    SAND: 4,
+    WATER: 5,
+    WOOD: 6,
+    LEAVES: 7
+};
+
 const TIME_SETTINGS = {
     DAY_LENGTH_SECONDS: 600,
     CELESTIAL_RADIUS: 300,
@@ -42,12 +53,12 @@ const TIME_SETTINGS = {
         NIGHT: 0x000022   
     },
     AMBIENT_LIGHT: {
-        DAY: 0.6,         
-        NIGHT: 0.2
+        DAY: 0.8,         
+        NIGHT: 0.3        
     },
     DIRECTIONAL_LIGHT: {
-        DAY: 0.8,         
-        NIGHT: 0.0
+        DAY: 1.0,         
+        NIGHT: 0.1        
     },
     TIMES: {
         SUNRISE: 0.25,    
@@ -72,17 +83,13 @@ const SETTINGS = {
     MIN_TERRAIN_HEIGHT: 3,
     STAR_COUNT: 1000,
     AO_STRENGTH: 0.5,
-    MAX_REACH: 4
-};
-const BLOCKS = {
-    AIR: 0,
-    DIRT: 1,
-    GRASS: 2,
-    STONE: 3,
-    SAND: 4,
-    WATER: 5,
-    WOOD: 6,
-    LEAVES: 7
+    MAX_REACH: 4,
+    CHUNK_UPDATE_INTERVAL: 5,
+    AMBIENT_LIGHT: 0.8,
+    DIRECTIONAL_LIGHT: 1.0,
+    FOG_COLOR: 0x87ceeb,
+    FOG_NEAR: 20,
+    FOG_FAR: 80
 };
 
 const INVENTORY = {
@@ -98,11 +105,7 @@ const INVENTORY = {
     ]
 };
 
-
-
-
-
-// Initialize inventory with default blocks
+// Initialize inventory
 for (let i = 0; i < INVENTORY.blockTypes.length; i++) {
     INVENTORY.slots[i] = INVENTORY.blockTypes[i];
 }
@@ -111,8 +114,6 @@ const NOISE = {
     SCALE: 0.03,
     WATER_LEVEL: 4
 };
-
-
 
 const BIOMES = {
     PLAINS: 'plains',
@@ -159,20 +160,25 @@ const BLOCK_COLORS = {
     [BLOCKS.LEAVES]: 0x3ABB3A
 };
 
-// Scene Setup
+// Scene Setup with improved lighting
 const scene = new THREE.Scene();
+scene.fog = new THREE.Fog(SETTINGS.FOG_COLOR, SETTINGS.FOG_NEAR, SETTINGS.FOG_FAR);
+
 const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+const renderer = new THREE.WebGLRenderer({ 
+    antialias: true,
+    powerPreference: "high-performance"
+});
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 document.body.appendChild(renderer.domElement);
 
 // Enhanced lighting setup
-const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+const ambientLight = new THREE.AmbientLight(0xffffff, SETTINGS.AMBIENT_LIGHT);
 scene.add(ambientLight);
 
-const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+const directionalLight = new THREE.DirectionalLight(0xffffff, SETTINGS.DIRECTIONAL_LIGHT);
 directionalLight.position.set(100, 100, 100);
 directionalLight.target.position.set(0, 0, 0);
 directionalLight.castShadow = true;
@@ -188,22 +194,13 @@ directionalLight.shadow.bias = -0.001;
 scene.add(directionalLight);
 scene.add(directionalLight.target);
 
-const secondaryLight = new THREE.DirectionalLight(0xffffff, 0.2);
-secondaryLight.position.set(-50, 50, -50);
-scene.add(secondaryLight);
+const hemisphereLight = new THREE.HemisphereLight(0xffffff, 0x444444, 0.6);
+scene.add(hemisphereLight);
 
-// Create instanced mesh for water
-const waterGeometry = new THREE.BoxGeometry(1, 1, 1);
-const waterMaterial = new THREE.MeshPhongMaterial({
-    color: BLOCK_COLORS[BLOCKS.WATER],
-    transparent: true,
-    opacity: 0.6,
-    side: THREE.DoubleSide,
-    depthWrite: false
-});
-
+// Chunk management
 const chunks = new Map();
-const waterInstances = new Map();
+const chunkGenerationQueue = [];
+let isGeneratingChunk = false;
 
 class DayNightCycle {
     constructor(scene) {
@@ -235,7 +232,11 @@ class DayNightCycle {
             );
         }
         starGeometry.setAttribute('position', new THREE.Float32BufferAttribute(starVertices, 3));
-        const starMaterial = new THREE.PointsMaterial({ color: 0xffffff, size: 2 });
+        const starMaterial = new THREE.PointsMaterial({ 
+            color: 0xffffff, 
+            size: 2,
+            sizeAttenuation: false
+        });
         this.stars = new THREE.Points(starGeometry, starMaterial);
         scene.add(this.stars);
     }
@@ -271,6 +272,8 @@ class DayNightCycle {
             .lerp(new THREE.Color(TIME_SETTINGS.SKY_COLORS.DAY), transitionProgress);
         renderer.setClearColor(skyColor);
 
+        scene.fog.color.copy(skyColor);
+
         ambientLight.intensity = THREE.MathUtils.lerp(
             TIME_SETTINGS.AMBIENT_LIGHT.NIGHT,
             TIME_SETTINGS.AMBIENT_LIGHT.DAY,
@@ -284,6 +287,8 @@ class DayNightCycle {
         );
 
         this.stars.visible = transitionProgress < 0.5;
+        this.sun.visible = isDay;
+        this.moon.visible = !isDay;
     }
 }
 
@@ -295,6 +300,7 @@ class Chunk {
         this.waterMesh = null;
         this.blocks = new Array(SETTINGS.CHUNK_SIZE * SETTINGS.WORLD_HEIGHT * SETTINGS.CHUNK_SIZE).fill(BLOCKS.AIR);
         this.modified = false;
+        this.isGenerating = false;
     }
 
     getBlock(x, y, z) {
@@ -308,28 +314,18 @@ class Chunk {
         this.modified = true;
     }
 
-    getBiome(worldX, worldZ) {
-        const temperature = noise2D(worldX * 0.01, worldZ * 0.01);
-        const moisture = noise2D(worldX * 0.01 + 500, worldZ * 0.01 + 500);
-
-        if (temperature < -0.2) return BIOMES.OCEAN;
-        if (temperature > 0.4 && moisture < 0) return BIOMES.DESERT;
-        if (moisture > 0.3) return BIOMES.FOREST;
-        return BIOMES.PLAINS;
-    }
-
     generate() {
+        this.isGenerating = true;
         for (let x = 0; x < SETTINGS.CHUNK_SIZE; x++) {
             for (let z = 0; z < SETTINGS.CHUNK_SIZE; z++) {
-                const worldX = this.x * SETTINGS.CHUNK_SIZE + x;
-                const worldZ = this.z * SETTINGS.CHUNK_SIZE + z;
+                const wx = x + this.x * SETTINGS.CHUNK_SIZE;
+                const wz = z + this.z * SETTINGS.CHUNK_SIZE;
                 
-                const biome = this.getBiome(worldX, worldZ);
-                const biomeSettings = BIOME_SETTINGS[biome];
-                
-                const baseHeight = (noise2D(worldX * NOISE.SCALE, worldZ * NOISE.SCALE) + 1) 
-                    * biomeSettings.heightScale + SETTINGS.MIN_TERRAIN_HEIGHT;
-                const height = Math.floor(baseHeight);
+                const height = Math.floor(
+                    (noise2D(wx * NOISE.SCALE, wz * NOISE.SCALE) + 1) * 
+                    SETTINGS.WORLD_HEIGHT / 4 + 
+                    SETTINGS.MIN_TERRAIN_HEIGHT
+                );
 
                 for (let y = 0; y < SETTINGS.WORLD_HEIGHT; y++) {
                     if (y === 0) {
@@ -337,40 +333,43 @@ class Chunk {
                     } else if (y < height - 4) {
                         this.setBlock(x, y, z, BLOCKS.STONE);
                     } else if (y < height) {
-                        this.setBlock(x, y, z, biomeSettings.subSurfaceBlock);
+                        this.setBlock(x, y, z, BLOCKS.DIRT);
                     } else if (y === height) {
-                        this.setBlock(x, y, z, biomeSettings.surfaceBlock);
-                    } else if (biome === BIOMES.OCEAN && y <= biomeSettings.waterLevel) {
+                        this.setBlock(x, y, z, BLOCKS.GRASS);
+                    } else if (y <= NOISE.WATER_LEVEL) {
                         this.setBlock(x, y, z, BLOCKS.WATER);
                     }
                 }
 
-                if (height > NOISE.WATER_LEVEL + 1 && 
-                    Math.random() < biomeSettings.treeDensity) {
+                // Simple tree generation
+                if (Math.random() < 0.02 && height > NOISE.WATER_LEVEL) {
                     this.generateTree(x, height + 1, z);
                 }
             }
         }
         this.createMesh();
+        this.isGenerating = false;
     }
 
     generateTree(x, y, z) {
-        const trunkHeight = 4 + Math.floor(Math.random() * 2);
-        for (let i = 0; i < trunkHeight; i++) {
-            this.setBlock(x, y + i, z, BLOCKS.WOOD);
+        const treeHeight = 4 + Math.floor(Math.random() * 3);
+        
+        // Tree trunk
+        for (let dy = 0; dy < treeHeight; dy++) {
+            if (y + dy < SETTINGS.WORLD_HEIGHT) {
+                this.setBlock(x, y + dy, z, BLOCKS.WOOD);
+            }
         }
 
+        // Tree leaves
         for (let dx = -2; dx <= 2; dx++) {
-            for (let dz = -2; dz <= 2; dz++) {
-                for (let dy = trunkHeight - 2; dy <= trunkHeight + 1; dy++) {
-                    const distance = Math.sqrt(dx * dx + dz * dz);
-                    if (distance < (dy === trunkHeight + 1 ? 1.5 : 2.5)) {
-                        const lx = x + dx;
-                        const ly = y + dy;
-                        const lz = z + dz;
-                        if (this.isInChunk(lx, ly, lz)) {
-                            this.setBlock(lx, ly, lz, BLOCKS.LEAVES);
-                        }
+            for (let dy = -2; dy <= 2; dy++) {
+                for (let dz = -2; dz <= 2; dz++) {
+                    const lx = x + dx;
+                    const ly = y + treeHeight + dy;
+                    const lz = z + dz;
+                    if (this.isInChunk(lx, ly, lz)) {
+                        this.setBlock(lx, ly, lz, BLOCKS.LEAVES);
                     }
                 }
             }
@@ -383,40 +382,35 @@ class Chunk {
                z >= 0 && z < SETTINGS.CHUNK_SIZE;
     }
 
-    calculateAO(x, y, z, side) {
-        let ao = 0;
-        const corners = [];
+    shouldRenderFace(x, y, z, adjacentX, adjacentY, adjacentZ) {
+        if (adjacentY < 0 || adjacentY >= SETTINGS.WORLD_HEIGHT) return true;
         
-        switch(side) {
-            case 'top':
-                corners.push(
-                    this.getBlock(x-1, y, z-1) !== BLOCKS.AIR,
-                    this.getBlock(x-1, y, z+1) !== BLOCKS.AIR,
-                    this.getBlock(x+1, y, z-1) !== BLOCKS.AIR,
-                    this.getBlock(x+1, y, z+1) !== BLOCKS.AIR
-                );
-                break;
-            case 'bottom':
-                corners.push(
-                    this.getBlock(x-1, y, z-1) !== BLOCKS.AIR,
-                    this.getBlock(x-1, y, z+1) !== BLOCKS.AIR,
-                    this.getBlock(x+1, y, z-1) !== BLOCKS.AIR,
-                    this.getBlock(x+1, y, z+1) !== BLOCKS.AIR
-                );
-                break;
-            // Add cases for other sides
+        const currentBlock = this.getBlock(x, y, z);
+        let adjacentBlock;
+
+        if (adjacentX < 0 || adjacentX >= SETTINGS.CHUNK_SIZE || 
+            adjacentZ < 0 || adjacentZ >= SETTINGS.CHUNK_SIZE) {
+            const worldX = this.x * SETTINGS.CHUNK_SIZE + adjacentX;
+            const worldZ = this.z * SETTINGS.CHUNK_SIZE + adjacentZ;
+            adjacentBlock = getWorldBlock(worldX, adjacentY, worldZ);
+        } else {
+            adjacentBlock = this.getBlock(adjacentX, adjacentY, adjacentZ);
         }
-        
-        ao = corners.filter(Boolean).length * SETTINGS.AO_STRENGTH;
-        return 1 - ao;
+
+        return adjacentBlock === BLOCKS.AIR || 
+               (adjacentBlock === BLOCKS.WATER && currentBlock !== BLOCKS.WATER);
     }
 
     createMesh() {
         if (this.mesh) {
             scene.remove(this.mesh);
+            this.mesh.geometry.dispose();
+            this.mesh.material.dispose();
         }
         if (this.waterMesh) {
             scene.remove(this.waterMesh);
+            this.waterMesh.geometry.dispose();
+            this.waterMesh.material.dispose();
         }
 
         const geometry = new THREE.BufferGeometry();
@@ -428,34 +422,17 @@ class Chunk {
         const normals = [];
         const waterNormals = [];
 
-        const shouldRenderFace = (x, y, z, adjacentX, adjacentY, adjacentZ) => {
-            if (adjacentY < 0 || adjacentY >= SETTINGS.WORLD_HEIGHT) return true;
-            if (x < 0 || x >= SETTINGS.CHUNK_SIZE || z < 0 || z >= SETTINGS.CHUNK_SIZE) {
-                const worldX = this.x * SETTINGS.CHUNK_SIZE + x;
-                const worldZ = this.z * SETTINGS.CHUNK_SIZE + z;
-                const block = getWorldBlock(worldX, adjacentY, worldZ);
-                return block === BLOCKS.AIR || 
-                       (block === BLOCKS.WATER && this.getBlock(x, y, z) !== BLOCKS.WATER);
-            }
-            const block = this.getBlock(adjacentX, adjacentY, adjacentZ);
-            return block === BLOCKS.AIR || 
-                   (block === BLOCKS.WATER && this.getBlock(x, y, z) !== BLOCKS.WATER);
-        };
-
-        const addFace = (x1, y1, z1, x2, y2, z2, x3, y3, z3, x4, y4, z4, color, normal, side, isWater = false) => {
+        const addFace = (x1, y1, z1, x2, y2, z2, x3, y3, z3, x4, y4, z4, color, normal, isWater = false) => {
             const targetVertices = isWater ? waterVertices : vertices;
             const targetColors = isWater ? waterColors : colors;
             const targetNormals = isWater ? waterNormals : normals;
-
-            const ao = this.calculateAO(Math.floor(x1), Math.floor(y1), Math.floor(z1), side);
-            const shadedColor = color.clone().multiplyScalar(ao);
-
+            
             targetVertices.push(x1, y1, z1, x2, y2, z2, x3, y3, z3);
             targetVertices.push(x3, y3, z3, x4, y4, z4, x1, y1, z1);
             
             for (let i = 0; i < 6; i++) {
                 targetNormals.push(normal.x, normal.y, normal.z);
-                targetColors.push(shadedColor.r, shadedColor.g, shadedColor.b);
+                targetColors.push(color.r, color.g, color.b);
             }
         };
 
@@ -470,45 +447,47 @@ class Chunk {
                     const wx = x + this.x * SETTINGS.CHUNK_SIZE;
                     const wz = z + this.z * SETTINGS.CHUNK_SIZE;
 
-                    if (shouldRenderFace(x, y, z, x, y + 1, z)) {
+                    if (this.shouldRenderFace(x, y, z, x, y + 1, z)) {
                         addFace(wx, y + 1, wz, wx, y + 1, wz + 1, wx + 1, y + 1, wz + 1, wx + 1, y + 1, wz, 
-                            color, new THREE.Vector3(0, 1, 0), 'top', isWater);
+                            color, new THREE.Vector3(0, 1, 0), isWater);
                     }
-                    if (shouldRenderFace(x, y, z, x, y - 1, z)) {
+                    if (this.shouldRenderFace(x, y, z, x, y - 1, z)) {
                         addFace(wx, y, wz, wx + 1, y, wz, wx + 1, y, wz + 1, wx, y, wz + 1, 
-                            color, new THREE.Vector3(0, -1, 0), 'bottom', isWater);
+                            color, new THREE.Vector3(0, -1, 0), isWater);
                     }
-                    if (shouldRenderFace(x, y, z, x - 1, y, z)) {
+                    if (this.shouldRenderFace(x, y, z, x - 1, y, z)) {
                         addFace(wx, y, wz, wx, y, wz + 1, wx, y + 1, wz + 1, wx, y + 1, wz, 
-                            color, new THREE.Vector3(-1, 0, 0), 'left', isWater);
+                            color, new THREE.Vector3(-1, 0, 0), isWater);
                     }
-                    if (shouldRenderFace(x, y, z, x + 1, y, z)) {
+                    if (this.shouldRenderFace(x, y, z, x + 1, y, z)) {
                         addFace(wx + 1, y, wz + 1, wx + 1, y + 1, wz + 1, wx + 1, y + 1, wz, wx + 1, y, wz, 
-                            color, new THREE.Vector3(1, 0, 0), 'right', isWater);
+                            color, new THREE.Vector3(1, 0, 0), isWater);
                     }
-                    if (shouldRenderFace(x, y, z, x, y, z - 1)) {
+                    if (this.shouldRenderFace(x, y, z, x, y, z - 1)) {
                         addFace(wx + 1, y, wz, wx + 1, y + 1, wz, wx, y + 1, wz, wx, y, wz, 
-                            color, new THREE.Vector3(0, 0, -1), 'front', isWater);
+                            color, new THREE.Vector3(0, 0, -1), isWater);
                     }
-                    if (shouldRenderFace(x, y, z, x, y, z + 1)) {
+                    if (this.shouldRenderFace(x, y, z, x, y, z + 1)) {
                         addFace(wx, y, wz + 1, wx, y + 1, wz + 1, wx + 1, y + 1, wz + 1, wx + 1, y, wz + 1, 
-                            color, new THREE.Vector3(0, 0, 1), 'back', isWater);
+                            color, new THREE.Vector3(0, 0, 1), isWater);
                     }
                 }
             }
         }
 
-        geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
-        geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
-        geometry.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+        if (vertices.length > 0) {
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+            geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+            geometry.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
 
-        const material = new THREE.MeshLambertMaterial({
-            vertexColors: true,
-            side: THREE.FrontSide
-        });
+            const material = new THREE.MeshLambertMaterial({
+                vertexColors: true,
+                side: THREE.FrontSide
+            });
 
-        this.mesh = new THREE.Mesh(geometry, material);
-        scene.add(this.mesh);
+            this.mesh = new THREE.Mesh(geometry, material);
+            scene.add(this.mesh);
+        }
 
         if (waterVertices.length > 0) {
             waterGeometry.setAttribute('position', new THREE.Float32BufferAttribute(waterVertices, 3));
@@ -530,7 +509,7 @@ class Chunk {
 }
 
 const player = {
-    position: new THREE.Vector3(0, SETTINGS.WORLD_HEIGHT, 0),
+    position: new THREE.Vector3(0, SETTINGS.WORLD_HEIGHT + 10, 0),
     velocity: new THREE.Vector3(0, 0, 0),
     rotation: new THREE.Euler(0, 0, 0, 'YXZ'),
     isOnGround: false
@@ -676,16 +655,30 @@ function updateLoadedChunks() {
     const playerChunkX = Math.floor(player.position.x / SETTINGS.CHUNK_SIZE);
     const playerChunkZ = Math.floor(player.position.z / SETTINGS.CHUNK_SIZE);
 
+    // Only update chunks every few frames
+    if (frame % SETTINGS.CHUNK_UPDATE_INTERVAL !== 0) return;
+
+    // Process chunk generation queue
+    if (chunkGenerationQueue.length > 0 && !isGeneratingChunk) {
+        isGeneratingChunk = true;
+        const chunk = chunkGenerationQueue.shift();
+        requestIdleCallback(() => {
+            chunk.generate();
+            isGeneratingChunk = false;
+        });
+    }
+
+    // Queue new chunks
     for (let dx = -SETTINGS.RENDER_DISTANCE; dx <= SETTINGS.RENDER_DISTANCE; dx++) {
         for (let dz = -SETTINGS.RENDER_DISTANCE; dz <= SETTINGS.RENDER_DISTANCE; dz++) {
             const chunkX = playerChunkX + dx;
             const chunkZ = playerChunkZ + dz;
             const key = `${chunkX},${chunkZ}`;
             
-            if (!chunks.has(key)) {
+            if (!chunks.has(key) && !chunkGenerationQueue.some(c => c.x === chunkX && c.z === chunkZ)) {
                 const chunk = new Chunk(chunkX, chunkZ);
                 chunks.set(key, chunk);
-                chunk.generate();
+                chunkGenerationQueue.push(chunk);
             }
         }
     }
@@ -703,21 +696,11 @@ function updateLoadedChunks() {
 }
 
 function isBlockBelow() {
-    const x = Math.floor(player.position.x);
-    const y = Math.floor(player.position.y - 0.1);
-    const z = Math.floor(player.position.z);
-    return getWorldBlock(x, y, z) !== BLOCKS.AIR;
-}
-
-function checkCollision(position) {
     const positions = [
-        // Check player's body bounds
-        {x: position.x - SETTINGS.PLAYER_WIDTH/2, y: position.y, z: position.z - SETTINGS.PLAYER_WIDTH/2},
-        {x: position.x + SETTINGS.PLAYER_WIDTH/2, y: position.y, z: position.z - SETTINGS.PLAYER_WIDTH/2},
-        {x: position.x - SETTINGS.PLAYER_WIDTH/2, y: position.y, z: position.z + SETTINGS.PLAYER_WIDTH/2},
-        {x: position.x + SETTINGS.PLAYER_WIDTH/2, y: position.y, z: position.z + SETTINGS.PLAYER_WIDTH/2},
-        // Check player's head
-        {x: position.x, y: position.y + SETTINGS.PLAYER_HEIGHT, z: position.z}
+        {x: player.position.x - 0.3, y: player.position.y - 0.1, z: player.position.z - 0.3},
+        {x: player.position.x + 0.3, y: player.position.y - 0.1, z: player.position.z - 0.3},
+        {x: player.position.x - 0.3, y: player.position.y - 0.1, z: player.position.z + 0.3},
+        {x: player.position.x + 0.3, y: player.position.y - 0.1, z: player.position.z + 0.3}
     ];
 
     for (const pos of positions) {
@@ -728,7 +711,29 @@ function checkCollision(position) {
     return false;
 }
 
+function checkCollision(position) {
+    const positions = [
+        // Check feet
+        {x: position.x - 0.3, y: position.y, z: position.z - 0.3},
+        {x: position.x + 0.3, y: position.y, z: position.z - 0.3},
+        {x: position.x - 0.3, y: position.y, z: position.z + 0.3},
+        {x: position.x + 0.3, y: position.y, z: position.z + 0.3},
+        // Check head
+        {x: position.x, y: position.y + SETTINGS.PLAYER_HEIGHT, z: position.z}
+    ];
+
+    for (const pos of positions) {
+        const block = getWorldBlock(Math.floor(pos.x), Math.floor(pos.y), Math.floor(pos.z));
+        if (block !== BLOCKS.AIR && block !== BLOCKS.WATER) {
+            return true;
+        }
+    }
+    return false;
+}
+
+let frame = 0;
 function animate() {
+    frame++;
     requestAnimationFrame(animate);
 
     dayNightCycle.update(renderer);
@@ -802,6 +807,13 @@ function animate() {
 
 // Create day/night cycle instance
 const dayNightCycle = new DayNightCycle(scene);
+
+// Handle window resizing
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
 
 // Start the animation loop
 animate();
